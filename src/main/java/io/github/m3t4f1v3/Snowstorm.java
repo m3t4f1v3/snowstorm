@@ -12,5 +12,7 @@ public class Snowstorm {
 
     public Snowstorm() {
         LOGGER.info("Snowstorm loaded");
+        // Register ValkyrienSkies collision listeners (if VS is present)
+        io.github.m3t4f1v3.util.VSCollisionEvents.register();
     }
 }
