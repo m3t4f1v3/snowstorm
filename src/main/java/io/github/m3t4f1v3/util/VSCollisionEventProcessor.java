@@ -1,6 +1,7 @@
 package io.github.m3t4f1v3.util;
 
 import io.github.m3t4f1v3.Snowstorm;
+import io.github.m3t4f1v3.network.SnowstormNetwork;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -27,6 +28,11 @@ import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4dc;
 import org.joml.Vector3d;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ThreadLocalRandom;
+
 /**
  * Drains queued ValkyrienSkies CollisionEvent instances and forwards contact
  * points to the ice-cracking logic on the server thread.
@@ -40,7 +46,16 @@ public final class VSCollisionEventProcessor {
     private static final double ICE_CONTACT_TOLERANCE = 0.35;
     private static final double ICE_MAX_PENETRATION = 0.5;
     private static final double MIN_STRESS_TO_CRACK = 0.5;
+    private static final int MAX_EVENTS_PER_DRAIN = 64;
+    private static final ConcurrentLinkedQueue<CollisionEvent> PENDING_EVENTS = new ConcurrentLinkedQueue<>();
     private static long lastDebugTick = Long.MIN_VALUE;
+
+    public static void submitCollision(CollisionEvent ev) {
+        PENDING_EVENTS.add(ev);
+    }
+
+    public static void ensureCollisionWorker() {
+    }
 
     @SubscribeEvent
     public static void onServerTick(TickEvent.ServerTickEvent evt) {
@@ -49,224 +64,145 @@ public final class VSCollisionEventProcessor {
         MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
         if (server == null) return;
         VSCollisionEvents.register();
-        final Logger LOGGER = LogUtils.getLogger();
+        flushPendingEvents(server, LogUtils.getLogger());
+    }
+
+    private static void flushPendingEvents(MinecraftServer server, Logger LOGGER) {
+        List<CollisionEvent> drained = new ArrayList<>();
+        CollisionEvent polled;
+        int processed = 0;
+        while (processed < MAX_EVENTS_PER_DRAIN && (polled = PENDING_EVENTS.poll()) != null) {
+            drained.add(polled);
+            processed++;
+        }
+
+        if (drained.isEmpty()) return;
+
+        if (isDebugEnabled()) {
+            LOGGER.debug("VS ice: drainedEvents={} backlog={}", drained.size(), PENDING_EVENTS.size());
+        }
 
         VsiServerShipWorld maybeShipWorld = VSGameUtilsKt.getShipObjectWorld(server);
+        if (maybeShipWorld == null) return;
 
-        // Drain once per tick
-        CollisionEvent ev;
-        while ((ev = VSCollisionEvents.QUEUE.poll()) != null) {
-            long shipIdA = ev.getShipIdA();
-            long shipIdB = ev.getShipIdB();
+        for (CollisionEvent ev : drained) {
+            processCollisionEvent(server, LOGGER, maybeShipWorld, ev);
+        }
+    }
 
-            CollisionBodyInfo bodyInfo = resolveCollisionBodyInfo(maybeShipWorld, shipIdA, shipIdB, ev.getDimensionId());
+    private static void processCollisionEvent(MinecraftServer server, Logger LOGGER, VsiServerShipWorld maybeShipWorld, CollisionEvent ev) {
+        String dimensionId = ev.getDimensionId();
+        ServerLevel level = resolveEventLevel(server, dimensionId);
+        if (level == null) return;
 
-            ServerLevel level = resolveEventLevel(server, ev.getDimensionId());
-            if (level == null) {
-                if (isDebugEnabled()) {
-                    LOGGER.info("VS ice: dropped event because dimension '{}' did not match any server level", ev.getDimensionId());
-                }
-                continue;
-            }
+        long shipIdA = ev.getShipIdA();
+        long shipIdB = ev.getShipIdB();
+        CollisionBodyInfo bodyInfo = resolveCollisionBodyInfo(maybeShipWorld, shipIdA, shipIdB, dimensionId);
+        LoadedServerShip ship = bodyInfo.ship();
+        if (ship == null) return;
 
-            LoadedServerShip ship = bodyInfo.ship();
-            if (ship == null) {
-                if (isDebugEnabled()) {
-                    LOGGER.info("VS ice: ignored collision dim={} shipA={} shipB={} because the ship could not be resolved from the collision ids",
-                            ev.getDimensionId(), shipIdA, shipIdB);
-                }
-                continue;
-            }
+        double shipMassToUse = bodyInfo.shipMass();
+        if (!(shipMassToUse > 0.0)) return;
 
-            double shipMassToUse = bodyInfo.shipMass();
-            if (!(shipMassToUse > 0.0)) {
-                if (isDebugEnabled()) {
-                    LOGGER.info("VS ice: ignored collision dim={} shipA={} shipB={} because resolved ship mass was invalid",
-                            ev.getDimensionId(), shipIdA, shipIdB);
-                }
-                continue;
-            }
+        List<BlockPos> fractureSeeds = new ArrayList<>();
+        List<Vector3d> fractureWorldPositions = new ArrayList<>();
+        double minX = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY;
+        double minZ = Double.POSITIVE_INFINITY;
+        double maxZ = Double.NEGATIVE_INFINITY;
+        double sumNormalSpeedSq = 0.0;
+        double maxPenetration = 0.0;
 
-            var contactPoints = ev.getContactPoints();
-            if (contactPoints.isEmpty()) {
-                if (isDebugEnabled()) {
-                    LOGGER.info("VS ice: ignored ground collision dim={} shipA={} shipB={} groundSide={} because it had no contacts",
-                            ev.getDimensionId(), shipIdA, shipIdB, bodyInfo.isShipAGround ? "A" : "B");
-                }
-                continue;
-            }
+        var contactPoints = ev.getContactPoints();
+        if (contactPoints == null || contactPoints.isEmpty()) return;
 
-            Matrix4dc shipToWorld = ship.getShipToWorld();
+        for (var cp : contactPoints) {
+            var posVec = cp.getPosition();
+            var normalVec = cp.getNormal();
+            var velocityVec = cp.getVelocity();
 
-            java.util.List<BlockPos> fractureSeeds = new java.util.ArrayList<>();
-            java.util.List<Vector3d> fractureWorldPositions = new java.util.ArrayList<>();
-            double minX = Double.POSITIVE_INFINITY;
-            double maxX = Double.NEGATIVE_INFINITY;
-            double minZ = Double.POSITIVE_INFINITY;
-            double maxZ = Double.NEGATIVE_INFINITY;
-            double sumNormalSpeedSq = 0.0;
-            double maxPenetration = 0.0;
-            int iceContactCount = 0;
+            Vector3d worldPosition = new Vector3d(posVec);
+            Vector3d worldNormal = new Vector3d(normalVec);
 
-            for (var cp : contactPoints) {
-                var posVec = cp.getPosition();
-                var normalVec = cp.getNormal();
-                var velocityVec = cp.getVelocity();
+            BlockPos contactPos = resolveContactBlock(
+                    level,
+                    new BlockPos(
+                            (int) Math.floor(worldPosition.x()),
+                            (int) Math.floor(worldPosition.y()),
+                            (int) Math.floor(worldPosition.z())
+                    ),
+                    worldNormal.x(),
+                    worldNormal.y(),
+                    worldNormal.z()
+            );
+            if (contactPos == null) continue;
 
-                // CollisionEvent contact points are already provided in world coordinates
-                Vector3d worldPosition = new Vector3d(posVec);
-                Vector3d worldNormal = new Vector3d(normalVec);
+            BlockState contactState = level.getBlockState(contactPos);
+            if (!contactState.is(Blocks.ICE) && !contactState.is(Blocks.FROSTED_ICE)) continue;
 
-                if (isDebugEnabled()) {
-                    LOGGER.info(
-                            "VS ice: contact dim={} shipA={} shipB={} rawPos={} worldPos={} rawNormal={} worldNormal={} separation={} velocity={}",
-                            ev.getDimensionId(), shipIdA, shipIdB, posVec, worldPosition, normalVec, worldNormal,
-                            cp.getSeparation(), velocityVec
-                    );
-                }
+            minX = Math.min(minX, worldPosition.x());
+            maxX = Math.max(maxX, worldPosition.x());
+            minZ = Math.min(minZ, worldPosition.z());
+            maxZ = Math.max(maxZ, worldPosition.z());
+            sumNormalSpeedSq += normalSpeedSquared(velocityVec, worldNormal);
+            maxPenetration = Math.max(maxPenetration, Math.min(ICE_MAX_PENETRATION, Math.max(0.0, -cp.getSeparation())));
+            fractureSeeds.add(contactPos.immutable());
+            fractureWorldPositions.add(new Vector3d(worldPosition));
+        }
 
-                BlockPos contactPos = resolveContactBlock(
+        if (fractureSeeds.isEmpty()) return;
+
+        float[] eventColor = randomContactColor();
+        if (isDebugEnabled()) {
+            for (Vector3d fractureWorldPosition : fractureWorldPositions) {
+                SnowstormNetwork.sendContactQuad(
                         level,
-                        new BlockPos(
-                                (int) Math.floor(worldPosition.x()),
-                                (int) Math.floor(worldPosition.y()),
-                                (int) Math.floor(worldPosition.z())
-                        ),
-                        worldNormal.x(),
-                        worldNormal.y(),
-                        worldNormal.z()
-                );
-                if (contactPos == null) {
-                    if (isDebugEnabled()) {
-                        LOGGER.info("VS ice: dropped contact dim={} shipA={} shipB={} because no support block matched rawBlockPos={} worldPos={} worldNormal={}",
-                                ev.getDimensionId(), shipIdA, shipIdB,
-                                new BlockPos((int) Math.floor(worldPosition.x()), (int) Math.floor(worldPosition.y()), (int) Math.floor(worldPosition.z())),
-                                worldPosition, worldNormal);
-                    }
-                    continue;
-                }
-
-                BlockState contactState = level.getBlockState(contactPos);
-                if (!contactState.is(Blocks.ICE) && !contactState.is(Blocks.FROSTED_ICE)) {
-                    if (isDebugEnabled()) {
-                        LOGGER.info("VS ice: dropped contact dim={} shipA={} shipB={} contactPos={} state={} worldPos={} worldNormal={}",
-                                ev.getDimensionId(), shipIdA, shipIdB, contactPos, contactState, worldPosition, worldNormal);
-                    }
-                    continue;
-                }
-
-                minX = Math.min(minX, worldPosition.x());
-                maxX = Math.max(maxX, worldPosition.x());
-                minZ = Math.min(minZ, worldPosition.z());
-                maxZ = Math.max(maxZ, worldPosition.z());
-                sumNormalSpeedSq += normalSpeedSquared(velocityVec, worldNormal);
-                maxPenetration = Math.max(maxPenetration, Math.min(ICE_MAX_PENETRATION, Math.max(0.0, -cp.getSeparation())));
-                fractureSeeds.add(contactPos.immutable());
-                fractureWorldPositions.add(new Vector3d(worldPosition));
-                iceContactCount++;
-            }
-
-            if (iceContactCount == 0) {
-                if (isDebugEnabled()) {
-                    LOGGER.info("VS ice: no ice contacts survived filtering dim={} shipA={} shipB={} contacts={} shipMass={}",
-                            ev.getDimensionId(), shipIdA, shipIdB, contactPoints.size(), shipMassToUse);
-                }
-                continue;
-            }
-
-            double footprintWidth = Math.max(1.0, maxX - minX + 1.0);
-            double footprintDepth = Math.max(1.0, maxZ - minZ + 1.0);
-            double footprintArea = Math.max(MIN_CONTACT_PATCH_AREA_M2, footprintWidth * footprintDepth * BLOCK_FACE_AREA_M2);
-            double averageNormalSpeed = Math.sqrt(sumNormalSpeedSq / iceContactCount);
-            //todo: make this level specific
-            double gravity = AerodynamicUtils.GRAVITATIONAL_ACCELERATION;
-            double staticPressure = (shipMassToUse * gravity) / footprintArea;
-            double stoppingDistance = Math.max(PENETRATION_FAILURE_DEPTH_M, ICE_CONTACT_TOLERANCE + maxPenetration);
-            double impactPressure = (0.5 * shipMassToUse * averageNormalSpeed * averageNormalSpeed) / (footprintArea * stoppingDistance);
-            double stress = (staticPressure + impactPressure) / ICE_FAILURE_STRESS_PA + Math.min(4.0, maxPenetration / PENETRATION_FAILURE_DEPTH_M);
-
-            if (stress < MIN_STRESS_TO_CRACK) {
-                if (isDebugEnabled()) {
-                    LOGGER.info("VS ice: stress below threshold dim={} shipA={} shipB={} stressRatio={} footprintArea={} penetration={} averageNormalSpeed={}",
-                            ev.getDimensionId(), shipIdA, shipIdB, stress, footprintArea, maxPenetration, averageNormalSpeed);
-                }
-                continue;
-            }
-
-            // Base radius from contact footprint, scaled by stress so higher-pressure
-            // collisions produce larger fracture zones. Clamp to reasonable bounds.
-            double baseRadius = contactRadiusForFootprint(footprintArea);
-            double stressScale = 1.0 + Math.min(2.0, stress); // up to 3x size
-            double fractureRadius = Math.max(1.0, Math.min(6.0, baseRadius * stressScale));
-
-            Vector3dc shipCoMShip = ship.getInertiaData().getCenterOfMass();
-
-            Vector3d shipCoMWorld = ship.getShipToWorld().transformPosition(new Vector3d(shipCoMShip));
-
-            double footprintRadius = Math.sqrt(footprintArea / Math.PI);
-
-            double sigma = Math.max(1.5, footprintRadius * 0.6);
-
-            // Compute per-seed stress weights biased by proximity to ship center-of-mass.
-            double[] weights = new double[fractureSeeds.size()];
-            double weightSum = 0.0;
-            for (int i = 0; i < fractureSeeds.size(); i++) {
-                Vector3d p = fractureWorldPositions.get(i);
-                double dx = p.x() - shipCoMWorld.x();
-                double dz = p.z() - shipCoMWorld.z();
-                double distSqr = 
-                    dx * dx + 
-                    dz * dz;
-                
-                double w = 1.0 / (distSqr + 0.01); // avoid divide-by-zero and overly large weights for very close seeds
-                weights[i] = w;
-                weightSum += w;
-            }
-
-            if (isDebugEnabled()) {
-                LOGGER.info("VS ice: dim={} shipA={} shipB={} groundSide={} crackPos={} footprintArea={} fractureRadius={} mass={} staticPa={} impactPa={} penetration={} stressRatio={}",
-                        ev.getDimensionId(), shipIdA, shipIdB, bodyInfo.isShipAGround ? "A" : "B",
-                        fractureSeeds.get(0), footprintArea, fractureRadius, shipMassToUse,
-                        staticPressure, impactPressure, maxPenetration, stress);
-            }
-
-            if (isDebugEnabled()) {
-                LOGGER.info("VS ice: shipCoMWorld={} seeds={} footprintArea={} stress={}", shipCoMWorld, fractureSeeds.size(), footprintArea, stress);
-                for (int i = 0; i < fractureSeeds.size(); i++) {
-                    Vector3d p = fractureWorldPositions.get(i);
-                    double dx = p.x() - (shipCoMWorld == null ? 0.0 : shipCoMWorld.x());
-                    double dz = p.z() - (shipCoMWorld == null ? 0.0 : shipCoMWorld.z());
-                    double distSq = dx * dx + dz * dz;
-                    double normalized = (weightSum > 0.0) ? (weights[i] / weightSum) : 0.0;
-                    LOGGER.info("VS ice: seedIdx={} seedPos={} worldPos={} distSq={} weight={} normalized={}", i, fractureSeeds.get(i), p, distSq, weights[i], normalized);
-                }
-            }
-
-            int seedCount = fractureSeeds.size();
-            for (int i = 0; i < seedCount; i++) {
-                double w = weights[i];
-                double normalized = (weightSum > 0.0) ? (w / weightSum) : (1.0 / seedCount);
-                // Scale per-seed stress so the average across seeds equals the computed
-                // `stress` but seeds nearer the CoM get proportionally more.
-                double perSeedStress = stress * normalized * seedCount;
-                if (perSeedStress < MIN_STRESS_TO_CRACK) {
-                    if (isDebugEnabled()) {
-                        LOGGER.info("VS ice: skipping seed {} perSeedStress={} (below min)", fractureSeeds.get(i), perSeedStress);
-                    }
-                    continue;
-                }
-                if (isDebugEnabled()) {
-                    LOGGER.info("VS ice: applying seedIdx={} seedPos={} perSeedStress={} perSeedRadius={}", i, fractureSeeds.get(i), perSeedStress, (fractureRadius * (0.5 + (weights[i] / weightSum))));
-                }
-                double perSeedRadius = fractureRadius * (0.5 + normalized);
-                BlockPos fractureSeed = fractureSeeds.get(i);
-                IceWalkingHandler.applyIceCrackingFromContactPoint(
-                        level,
-                        new Vec3(fractureSeed.getX(), fractureSeed.getY(), fractureSeed.getZ()),
-                        perSeedRadius,
-                        perSeedStress
+                        fractureWorldPosition.x(),
+                        fractureWorldPosition.y(),
+                        fractureWorldPosition.z(),
+                        eventColor[0],
+                        eventColor[1],
+                        eventColor[2],
+                        0.95f,
+                        0.45f + ThreadLocalRandom.current().nextFloat() * 0.25f,
+                        12 + ThreadLocalRandom.current().nextInt(6)
                 );
             }
+        }
+
+        double footprintWidth = Math.max(1.0, maxX - minX + 1.0);
+        double footprintDepth = Math.max(1.0, maxZ - minZ + 1.0);
+        double footprintArea = Math.max(MIN_CONTACT_PATCH_AREA_M2, footprintWidth * footprintDepth * BLOCK_FACE_AREA_M2);
+        double averageNormalSpeed = Math.sqrt(sumNormalSpeedSq / Math.max(1, fractureSeeds.size()));
+        double gravity = AerodynamicUtils.GRAVITATIONAL_ACCELERATION;
+        double staticPressure = (shipMassToUse * gravity) / footprintArea;
+        double stoppingDistance = Math.max(PENETRATION_FAILURE_DEPTH_M, ICE_CONTACT_TOLERANCE + maxPenetration);
+        double impactPressure = (0.5 * shipMassToUse * averageNormalSpeed * averageNormalSpeed) / (footprintArea * stoppingDistance);
+        double stress = (staticPressure + impactPressure) / ICE_FAILURE_STRESS_PA + Math.min(4.0, maxPenetration / PENETRATION_FAILURE_DEPTH_M);
+
+        if (stress < MIN_STRESS_TO_CRACK) return;
+
+        double baseRadius = contactRadiusForFootprint(footprintArea);
+        double stressScale = 1.0 + Math.min(2.0, stress);
+        double fractureRadius = Math.max(1.0, Math.min(6.0, baseRadius * stressScale));
+
+        double weightSum = fractureSeeds.size();
+
+        if (isDebugEnabled()) {
+            LOGGER.debug("VS ice: singleEvent dim={} shipA={} shipB={} contacts={} footprintArea={} fractureRadius={} mass={} staticPa={} impactPa={} penetration={} stressRatio={}",
+                    dimensionId, shipIdA, shipIdB, fractureSeeds.size(), footprintArea, fractureRadius, shipMassToUse, staticPressure, impactPressure, maxPenetration, stress);
+        }
+
+        for (int i = 0; i < fractureSeeds.size(); i++) {
+            double normalized = 1.0 / weightSum;
+            double perSeedStress = stress * normalized * fractureSeeds.size();
+            if (perSeedStress < MIN_STRESS_TO_CRACK) continue;
+
+            double perSeedRadius = fractureRadius * (0.5 + normalized);
+            if (isDebugEnabled()) {
+                LOGGER.debug("VS ice: applying seedIdx={} seedPos={} perSeedStress={} perSeedRadius={} worldPos={}", i, fractureSeeds.get(i), perSeedStress, perSeedRadius, fractureWorldPositions.get(i));
+            }
+            IceWalkingHandler.applyIceCrackingForBlock(level, fractureSeeds.get(i), perSeedStress);
         }
     }
 
@@ -289,6 +225,12 @@ public final class VSCollisionEventProcessor {
             return dimensionId.substring(markerIndex + marker.length());
         }
         return dimensionId;
+    }
+
+    private static String buildCollisionKey(String dimensionId, long shipIdA, long shipIdB) {
+        long min = Math.min(shipIdA, shipIdB);
+        long max = Math.max(shipIdA, shipIdB);
+        return normalizeDimensionId(dimensionId) + ":" + min + ":" + max;
     }
 
     private static BlockPos resolveContactBlock(ServerLevel level, BlockPos pos, double normalX, double normalY, double normalZ) {
@@ -370,6 +312,15 @@ public final class VSCollisionEventProcessor {
 
     private static boolean isDebugEnabled() {
         return IceWalkingHandler.DEBUG_MODE;
+    }
+
+    private static float[] randomContactColor() {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        return new float[] {
+                0.25f + random.nextFloat() * 0.75f,
+                0.25f + random.nextFloat() * 0.75f,
+                0.25f + random.nextFloat() * 0.75f
+        };
     }
 
     private record CollisionBodyInfo(boolean isShipAGround, double shipMass, LoadedServerShip ship) {

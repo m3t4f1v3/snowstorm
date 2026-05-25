@@ -5,8 +5,6 @@ import org.slf4j.Logger;
 import org.valkyrienskies.core.api.events.CollisionEvent;
 import org.valkyrienskies.mod.common.ValkyrienSkiesMod;
 
-import java.util.concurrent.ConcurrentLinkedQueue;
-
 /**
  * Minimal registrar that subscribes to ValkyrienSkies collision events and
  * enqueues them for processing on the Forge server thread.
@@ -15,8 +13,6 @@ public final class VSCollisionEvents {
 
     private VSCollisionEvents() {
     }
-
-    public static final ConcurrentLinkedQueue<CollisionEvent> QUEUE = new ConcurrentLinkedQueue<>();
 
     private static volatile boolean registered = false;
     private static volatile boolean apiUnavailableLogged = false;
@@ -36,12 +32,12 @@ public final class VSCollisionEvents {
         boolean debug = isDebugEnabled();
         api.getCollisionPersistEvent().on(ev -> {
             if (debug) {
-                LOGGER.info("VS enqueue persist: shipA={} shipB={} contacts={}",
-                        ev.getShipIdA(), ev.getShipIdB(), ev.getContactPoints() == null ? 0 : ev.getContactPoints().size());
+                LOGGER.info("VS enqueue persist: shipA={} shipB={}", ev.getShipIdA(), ev.getShipIdB());
             }
-            QUEUE.add(ev);
+            VSCollisionEventProcessor.submitCollision(ev);
         });
         registered = true;
+        VSCollisionEventProcessor.ensureCollisionWorker();
         LOGGER.info("VSCollisionEvents: registered collision listeners");
     }
 
