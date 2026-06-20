@@ -1,5 +1,7 @@
 package io.github.m3t4f1v3.mixin;
 
+import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.BlockGetter;
@@ -18,6 +20,7 @@ import net.minecraft.world.phys.shapes.EntityCollisionContext;
 import net.minecraft.world.phys.shapes.Shapes;
 import net.minecraft.world.phys.shapes.VoxelShape;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
@@ -31,76 +34,32 @@ public class SnowLayerBlockMixin {
         }
     }
 
-    @Inject(method = "getCollisionShape", at = @At("HEAD"), cancellable = true)
-    private void snowstorm$emptyCollisionShapeOverPowderSnow(
+    @WrapMethod(method = "getCollisionShape")
+    private VoxelShape snowstorm$emptyCollisionShapeOverPowderSnow(
             BlockState state,
             BlockGetter level,
             BlockPos pos,
             CollisionContext context,
-            CallbackInfoReturnable<VoxelShape> cir
+            Operation<VoxelShape> original
     ) {
+        VoxelShape originalShape = original.call(state, level, pos, context);
         if (!snowstorm$isPowderSnowLoaded(level, pos.below())) {
-            return;
+            return originalShape;
         }
         Entity entity = context instanceof EntityCollisionContext entityContext ? entityContext.getEntity() : null;
         if (entity != null && PowderSnowBlock.canEntityWalkOnPowderSnow(entity)) {
-            return;
+            return originalShape;
         }
-        cir.setReturnValue(Shapes.empty());
+        return Shapes.empty();
     }
 
-    @Inject(method = "getShape", at = @At("HEAD"), cancellable = true)
-    private void snowstorm$emptyOutlineShapeOverPowderSnow(
-            BlockState state,
-            BlockGetter level,
-            BlockPos pos,
-            CollisionContext context,
-            CallbackInfoReturnable<VoxelShape> cir
-    ) {
-        snowstorm$clearShapeWhenOverPowderSnow(level, pos, cir);
-    }
-
-    @Inject(method = "getVisualShape", at = @At("HEAD"), cancellable = true)
-    private void snowstorm$emptyVisualShapeOverPowderSnow(
-            BlockState state,
-            BlockGetter level,
-            BlockPos pos,
-            CollisionContext context,
-            CallbackInfoReturnable<VoxelShape> cir
-    ) {
-        snowstorm$clearShapeWhenOverPowderSnow(level, pos, cir);
-    }
-
-    @Inject(method = "getBlockSupportShape", at = @At("HEAD"), cancellable = true)
-    private void snowstorm$emptySupportShapeOverPowderSnow(
-            BlockState state,
-            BlockGetter level,
-            BlockPos pos,
-            CallbackInfoReturnable<VoxelShape> cir
-    ) {
-        snowstorm$clearShapeWhenOverPowderSnow(level, pos, cir);
-    }
-
-    private static void snowstorm$clearShapeWhenOverPowderSnow(
-            BlockGetter level,
-            BlockPos pos,
-            CallbackInfoReturnable<VoxelShape> cir
-    ) {
-        if (!snowstorm$isPowderSnowLoaded(level, pos.below())) {
-            return;
-        }
-        cir.setReturnValue(Shapes.empty());
-    }
-
+    @Unique
     private static boolean snowstorm$isPowderSnowLoaded(BlockGetter level, BlockPos pos) {
         int chunkX = pos.getX() >> 4;
         int chunkZ = pos.getZ() >> 4;
         if (level instanceof ServerLevel serverLevel) {
             LevelChunk chunk = serverLevel.getChunkSource().getChunkNow(chunkX, chunkZ);
             return chunk != null && chunk.getBlockState(pos).is(Blocks.POWDER_SNOW);
-        }
-        if (level instanceof Level) {
-            return false;
         }
         if (level instanceof LevelReader levelReader) {
             ChunkAccess chunk = levelReader.getChunk(chunkX, chunkZ, ChunkStatus.FULL, false);

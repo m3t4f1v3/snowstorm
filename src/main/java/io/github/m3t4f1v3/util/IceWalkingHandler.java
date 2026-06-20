@@ -20,7 +20,7 @@ import net.minecraftforge.fml.common.Mod;
 public class IceWalkingHandler {
     
     // Debug/test configuration
-    public static final boolean DEBUG_MODE = true;
+    public static final boolean DEBUG_MODE = false;
     private static final double TEST_WEIGHT = 150.0; // For testing without weight system
     private static final boolean USE_TEST_WEIGHT = false; // Set to true to bypass mass tracker
     

@@ -6,7 +6,6 @@
   "refmap": "snowstorm.refmap.json",
   "mixins": [
     "BlockPlaceContextMixin",
-    "PowderSnowBlockMixin",
     "ServerLevelMixin",
     "SnowRealMagicHooksMixin",
     "SnowLayerBlockMixin",
