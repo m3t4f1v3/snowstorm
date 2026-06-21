@@ -9,7 +9,8 @@
     "ServerLevelMixin",
     "SnowRealMagicHooksMixin",
     "SnowLayerBlockMixin",
-    "LivingEntityAccessor"
+    "LivingEntityAccessor",
+    "FursuitItemBootsMixin"
   ],
   "client": [
   ],
